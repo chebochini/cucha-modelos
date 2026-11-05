@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_SHA256: f814be1fa131137ed3a827a2fdb3a1ac6c439100d3c82496868cc4294341c45e
+  EXPECTED_SHA256: 2fb97e3996f6f002c31937f326b1061dad0f146f8462c3fe5205d8b1eb7fb773
 
 jobs:
   publish:
