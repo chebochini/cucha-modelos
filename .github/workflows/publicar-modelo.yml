@@ -1,0 +1,205 @@
+name: Publicar modelo HT-Demucs
+
+# Exporta HT-Demucs (pesos oficiales de Meta, licencia MIT) a ONNX para Cuchá,
+# verifica que sea exactamente el archivo que espera la app (SHA-256) y lo publica
+# en el release "htdemucs-v4". Se corre a mano: Actions -> Publicar modelo HT-Demucs -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  EXPECTED_SHA256: f814be1fa131137ed3a827a2fdb3a1ac6c439100d3c82496868cc4294341c45e
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar
+        run: pip install torch==2.15.0 demucs==4.1.0 onnx==1.23.2 onnxruntime einops==0.8.2 numpy==2.5.4
+
+      - name: Exportar
+        run: |
+          cat > export_demucs_onnx.py <<'PY'
+          """Exports the HT-Demucs network (Meta's htdemucs v4, MIT licence) to ONNX for Cuchá.
+
+          Only the neural network is exported: the STFT / ISTFT, the complex masking and the
+          overlapping segments are done in C++ (src/separation/DemucsSeparator.cpp), because
+          complex numbers do not export well. The script checks the export against PyTorch and
+          prints the SHA-256 that the app verifies after downloading the model.
+
+            pip install torch==2.15.0 demucs==4.1.0 onnx==1.23.2 onnxruntime einops==0.8.2 numpy==2.5.4
+            python tools/export_demucs_onnx.py htdemucs.onnx
+
+          With these versions repeated exports were byte-for-byte identical (SHA-256 f814be1f...);
+          which is the file the app downloads (see ModelInfo::demucs in src/app/ModelDownloader.cpp).
+          The weights are downloaded by demucs itself from Meta's official server.
+          """
+          import hashlib
+          import sys, time, os
+          import numpy as np, torch
+          from einops import rearrange
+          from demucs.pretrained import get_model
+
+          bag = get_model("htdemucs")
+          model = bag.models[0] if hasattr(bag, "models") else bag
+          model.eval()
+          SEG = int(model.segment * model.samplerate)  # fixed segment length used by apply_model
+
+
+          class Core(torch.nn.Module):
+              """HTDemucs.forward between the spectrogram and the masking/ISTFT."""
+
+              def __init__(self, m):
+                  super().__init__()
+                  self.m = m
+
+              def forward(self, mix, mag):
+                  m = self.m
+                  x = mag
+                  B, C, Fq, T = x.shape
+                  mean = x.mean(dim=(1, 2, 3), keepdim=True)
+                  std = x.std(dim=(1, 2, 3), keepdim=True)
+                  x = (x - mean) / (1e-5 + std)
+                  xt = mix
+                  meant = xt.mean(dim=(1, 2), keepdim=True)
+                  stdt = xt.std(dim=(1, 2), keepdim=True)
+                  xt = (xt - meant) / (1e-5 + stdt)
+                  saved, saved_t, lengths, lengths_t = [], [], [], []
+                  for idx, encode in enumerate(m.encoder):
+                      lengths.append(x.shape[-1])
+                      inject = None
+                      if idx < len(m.tencoder):
+                          lengths_t.append(xt.shape[-1])
+                          tenc = m.tencoder[idx]
+                          xt = tenc(xt)
+                          if not tenc.empty:
+                              saved_t.append(xt)
+                          else:
+                              inject = xt
+                      x = encode(x, inject)
+                      if idx == 0 and m.freq_emb is not None:
+                          frs = torch.arange(x.shape[-2], device=x.device)
+                          emb = m.freq_emb(frs).t()[None, :, :, None].expand_as(x)
+                          x = x + m.freq_emb_scale * emb
+                      saved.append(x)
+                  if m.crosstransformer:
+                      if m.bottom_channels:
+                          b, c, f, t = x.shape
+                          x = rearrange(x, "b c f t-> b c (f t)")
+                          x = m.channel_upsampler(x)
+                          x = rearrange(x, "b c (f t)-> b c f t", f=f)
+                          xt = m.channel_upsampler_t(xt)
+                      x, xt = m.crosstransformer(x, xt)
+                      if m.bottom_channels:
+                          x = rearrange(x, "b c f t-> b c (f t)")
+                          x = m.channel_downsampler(x)
+                          x = rearrange(x, "b c (f t)-> b c f t", f=f)
+                          xt = m.channel_downsampler_t(xt)
+                  for idx, decode in enumerate(m.decoder):
+                      skip = saved.pop(-1)
+                      x, pre = decode(x, skip, lengths.pop(-1))
+                      offset = m.depth - len(m.tdecoder)
+                      if idx >= offset:
+                          tdec = m.tdecoder[idx - offset]
+                          length_t = lengths_t.pop(-1)
+                          if tdec.empty:
+                              pre = pre[:, :, 0]
+                              xt, _ = tdec(pre, None, length_t)
+                          else:
+                              skip = saved_t.pop(-1)
+                              xt, _ = tdec(xt, skip, length_t)
+                  S = len(m.sources)
+                  x = x.view(B, S, -1, Fq, T)
+                  x = x * std[:, None] + mean[:, None]
+                  xt = xt.view(B, S, -1, SEG) * stdt[:, None] + meant[:, None]
+                  return x, xt
+
+
+          def full_from_core(m, mix, x, xt):
+              """What the app would do around the network: masking (complex) + ISTFT + time branch."""
+              z = m._spec(mix)
+              zout = m._mask(z, x)
+              return m._ispec(zout, SEG) + xt
+
+
+          torch.manual_seed(0)
+          mix = torch.randn(1, 2, SEG) * 0.1
+          with torch.no_grad():
+              ref = model(mix)
+              z = model._spec(mix)
+              mag = model._magnitude(z)
+              core = Core(model).eval()
+              x, xt = core(mix, mag)
+              mine = full_from_core(model, mix, x, xt)
+          print("wrapper vs PyTorch model: max abs diff", float((mine - ref).abs().max()))
+
+          out = sys.argv[1]
+          t0 = time.time()
+          torch.onnx.export(core, (mix, mag), out, input_names=["mix", "mag"], output_names=["spec", "wave"],
+                            opset_version=17, dynamo=False)
+          print(f"exported in {time.time() - t0:.1f} s, {os.path.getsize(out) / 1e6:.1f} MB, segment {SEG} samples ({SEG / model.samplerate:.2f} s)")
+
+          import onnxruntime as ort
+          so = ort.SessionOptions()
+          so.intra_op_num_threads = os.cpu_count()
+          sess = ort.InferenceSession(out, so, providers=["CPUExecutionProvider"])
+          feeds = {"mix": mix.numpy(), "mag": mag.numpy()}
+          sess.run(None, feeds)  # warm-up
+          t0 = time.time()
+          ox, oxt = sess.run(None, feeds)
+          t_ort = time.time() - t0
+          with torch.no_grad():
+              t0 = time.time()
+              core(mix, mag)
+              t_pt = time.time() - t0
+              full_ort = full_from_core(model, mix, torch.from_numpy(ox), torch.from_numpy(oxt))
+          print("ONNX Runtime vs PyTorch: max abs diff", float((full_ort - ref).abs().max()), "| ref peak", float(ref.abs().max()))
+          print(f"one {SEG / model.samplerate:.2f} s segment: ONNX Runtime {t_ort:.2f} s, PyTorch {t_pt:.2f} s")
+
+          h = hashlib.sha256()
+          with open(out, "rb") as f:
+              for block in iter(lambda: f.read(1 << 20), b""):
+                  h.update(block)
+          print("sha256", h.hexdigest())
+          PY
+          python export_demucs_onnx.py htdemucs-v4.onnx
+
+      - name: Verificar
+        id: check
+        run: |
+          actual=$(sha256sum htdemucs-v4.onnx | cut -d' ' -f1)
+          echo "esperado $EXPECTED_SHA256"
+          echo "obtenido $actual"
+          stat -c 'tamaño %s bytes' htdemucs-v4.onnx
+          echo "match=$([ "$actual" = "$EXPECTED_SHA256" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: htdemucs-v4-onnx
+          path: htdemucs-v4.onnx
+          compression-level: 0
+
+      - name: Publicar release htdemucs-v4
+        if: steps.check.outputs.match == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create htdemucs-v4 htdemucs-v4.onnx \
+            --title "HT-Demucs v4 (ONNX) para Cuchá" \
+            --notes "Modelo HT-Demucs v4 de Meta (licencia MIT, https://github.com/facebookresearch/demucs), exportado a ONNX para la separación de instrumentos de Cuchá. SHA-256: $EXPECTED_SHA256"
+
+      - name: El archivo no coincide
+        if: steps.check.outputs.match != 'yes'
+        run: |
+          echo "::error::El modelo exportado no es idéntico al que espera la app. No se publicó; pasale el SHA-256 y el tamaño de arriba a Claude para actualizar la app."
+          exit 1
